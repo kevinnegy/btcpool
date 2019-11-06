@@ -26,6 +26,7 @@
 #include "StratumBitcoin.h"
 #include "BitcoinUtils.h"
 
+#include "Utils.h"
 #include "rsk/RskSolvedShareData.h"
 
 #ifdef CHAIN_TYPE_ZEC
@@ -58,6 +59,9 @@ BlockMakerBitcoin::BlockMakerBitcoin(
   , submittedRskBlocks(0)
   , kafkaConsumerRawGbt_(
         kafkaBrokers, def()->rawGbtTopic_.c_str(), 0 /* patition */)
+  // Selfish miner kafka producer
+  , kafkaProducer_(
+		  kafkaBrokers, def()->rawGbtTopic_.c_str(), 0 )
   , kafkaConsumerStratumJob_(
         kafkaBrokers, def()->stratumJobTopic_.c_str(), 0 /* patition */)
 #ifndef CHAIN_TYPE_ZEC
@@ -95,6 +99,23 @@ bool BlockMakerBitcoin::init() {
   //
   // Raw Gbt
   //
+  // Selfish miner kafka produce
+  map<string, string> options;
+  // set to 1 (0 is an illegal value here), deliver msg as soon as possible.
+  options["queue.buffering.max.ms"] = "1";
+  if (!kafkaProducer_.setup(&options)) {
+    LOG(ERROR) << "kafka producer setup failure";
+    return false;
+  }
+
+  printf("Checking if kafka is alive\n");
+  // setup kafka and check if it's alive
+  if (!kafkaProducer_.checkAlive()) {
+    printf("kafka is NOT alive\n");
+    LOG(ERROR) << "kafka is NOT alive";
+    return false;
+  }
+  
   // we need to consume the latest N messages
   if (kafkaConsumerRawGbt_.setup(RD_KAFKA_OFFSET_TAIL(kMaxRawGbtNum_)) ==
       false) {
@@ -184,34 +205,119 @@ void BlockMakerBitcoin::consumeRawGbt(rd_kafka_message_t *rkmessage) {
   addRawgbt((const char *)rkmessage->payload, rkmessage->len);
 }
 
+// Precondition: private_chain must have at least one block
+// Postcondition: returns true if jgbt needs to be stored in rawGbtMap
+bool BlockMakerBitcoin::selfish_mine(JsonNode &jgbt){
+	int block_height = jgbt["height"].uint32() -1;
+
+	// new bitcoind block is several blocks behind our first SM block, return true to store in rawGbtMap
+	if(private_chain.begin()->first - block_height > 1){
+		return true;
+	}
+
+	// If last found block in gbt is one less than the first block in private_chain, either its our private_chain parent or a competing parent block
+	if(private_chain.begin()->first - block_height == 1){
+		return false ;
+	}
+
+	// Print first 3 blocks in private chain and their parent hash 
+	LOG(INFO) << "Private chain size: " << private_chain.size();
+	int i = 0;
+	for(auto it = private_chain.begin(); it != private_chain.end(); it++){
+		LOG(INFO) << it->first << ": " << it->second->GetHash().ToString() << " -> " << it->second->hashPrevBlock.ToString();
+		i++;
+		if(i == 3)
+			break;
+	}
+
+	// Check if private chain has a block at the same height as new block 
+	if(private_chain.find(block_height) != private_chain.end()){
+		auto selfish_block_hash = private_chain[block_height]->GetHash();
+
+		// If is our own block, only process if it hasn't been stored in rawGbtMap
+		if(jgbt["previousblockhash"].str().compare(selfish_block_hash.ToString()) == 0){
+			if(rawGbtMap_.find(selfish_block_hash) == rawGbtMap_.end())
+				return true; 
+			return false;
+		}
+	}
+
+	int difference = private_chain.rbegin()->first - block_height;
+
+	// Honest wins - erase private_chain
+	if(difference <= -1){
+		for(auto it = private_chain.begin(); it != private_chain.end(); it++){
+			delete it->second;
+		}	
+		private_chain.empty();
+	}
+
+	// TODO: if submit results in rejected block, reset jobmaker
+	else if(difference == 0){
+		const string blockHex = EncodeHexBlock(*private_chain[block_height]);
+		submitBlockNonBlocking(blockHex);
+		private_chain.erase(block_height);
+	}
+
+	else if(difference == 1){
+		if(private_chain.size() != 2){
+			LOG(FATAL) << "Private chain is size " << private_chain.size() << " instead of 2\n";
+		}
+
+		for(auto it = private_chain.begin(); it != private_chain.end(); it++){
+			const string blockHex = EncodeHexBlock(*it->second);
+			submitBlockNonBlocking(blockHex);
+			delete it->second;
+		}
+
+		private_chain.empty();
+	}
+
+	else{
+		const string blockHex = EncodeHexBlock(*private_chain[block_height]);
+		submitBlockNonBlocking(blockHex);
+		private_chain.erase(block_height);
+	}
+
+	return false;
+}
+
 void BlockMakerBitcoin::addRawgbt(const char *str, size_t len) {
-  JsonNode r;
-  if (!JsonNode::parse(str, str + len, r)) {
-    LOG(ERROR) << "parse rawgbt message to json fail";
-    return;
-  }
-  if (r["created_at_ts"].type() != Utilities::JS::type::Int ||
-      r["block_template_base64"].type() != Utilities::JS::type::Str ||
-      r["gbthash"].type() != Utilities::JS::type::Str) {
-    LOG(ERROR) << "invalid rawgbt: missing fields";
-    return;
-  }
+	JsonNode r;
+	if (!JsonNode::parse(str, str + len, r)) {
+		return;
+	}
+	if (r["created_at_ts"].type() != Utilities::JS::type::Int ||
+	  r["block_template_base64"].type() != Utilities::JS::type::Str ||
+	  r["gbthash"].type() != Utilities::JS::type::Str) {
+		LOG(ERROR) << "invalid rawgbt: missing fields";
+		return;
+	}
 
-  const uint256 gbtHash = uint256S(r["gbthash"].str());
-  if (rawGbtMap_.find(gbtHash) != rawGbtMap_.end()) {
-    LOG(ERROR) << "already exist raw gbt, ignore: " << gbtHash.ToString();
-    return;
-  }
+	const uint256 gbtHash = uint256S(r["gbthash"].str());
+	if (rawGbtMap_.find(gbtHash) != rawGbtMap_.end()) {
+		LOG(ERROR) << "already exist raw gbt, ignore: " << gbtHash.ToString();
+		return;
+	}
 
-  const string gbt = DecodeBase64(r["block_template_base64"].str());
-  assert(gbt.length() > 64); // valid gbt string's len at least 64 bytes
+	const string gbt = DecodeBase64(r["block_template_base64"].str());
+	assert(gbt.length() > 64); // valid gbt string's len at least 64 bytes
 
-  JsonNode nodeGbt;
-  if (!JsonNode::parse(gbt.c_str(), gbt.c_str() + gbt.length(), nodeGbt)) {
-    LOG(ERROR) << "parse gbt message to json fail";
-    return;
-  }
-  JsonNode jgbt = nodeGbt["result"];
+	JsonNode nodeGbt;
+	if (!JsonNode::parse(gbt.c_str(), gbt.c_str() + gbt.length(), nodeGbt)) {
+		LOG(ERROR) << "parse gbt message to json fail";
+		return;
+	}
+	JsonNode jgbt = nodeGbt["result"];
+	
+	// Only selfish mine if private chain has blocks
+	if(private_chain.size() > 0){
+		// selfish_mine returns false if block doesn't need to be stored in rawGbtMap
+		if(selfish_mine(jgbt) == false){
+			return;	
+		}
+	}
+
 
 #ifdef CHAIN_TYPE_BCH
   bool isLightVersion = jgbt["job_id"].type() == Utilities::JS::type::Str;
@@ -226,7 +332,9 @@ void BlockMakerBitcoin::addRawgbt(const char *str, size_t len) {
   // transaction without coinbase_tx
   shared_ptr<vector<CTransactionRef>> vtxs =
       std::make_shared<vector<CTransactionRef>>();
+  
   for (JsonNode &node : jgbt["transactions"].array()) {
+
 #ifdef CHAIN_TYPE_ZEC
     CTransaction tx;
     DecodeHexTx(tx, node["data"].str());
@@ -236,6 +344,7 @@ void BlockMakerBitcoin::addRawgbt(const char *str, size_t len) {
     DecodeHexTx(tx, node["data"].str());
     vtxs->push_back(MakeTransactionRef(std::move(tx)));
 #endif
+
   }
 
   LOG(INFO) << "insert rawgbt: " << gbtHash.ToString()
@@ -550,7 +659,140 @@ void BlockMakerBitcoin::_submitNamecoinBlockThread(
 }
 #endif
 
+bool BlockMakerBitcoin::bitcoindRpcGBT(string &response) {
+  string request =
+      "{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"method\":\"getblocktemplate\","
+      "\"params\":[{\"rules\" : [\"segwit\"]}]}";
+  bool res = blockchainNodeRpcCall(
+      def()->nodes.begin()->rpcAddr_.c_str(),
+      def()->nodes.begin()->rpcUserPwd_.c_str(),
+      request.c_str(),
+      response);
+  if (!res) {
+    LOG(ERROR) << "bitcoind rpc failure";
+    return false;
+  }
+  return true;
+}
+void find_and_replace(string &gbt, string find, string replace){
+	auto iter = gbt.find(find);
+	if(iter == string::npos){
+		LOG(ERROR) << "Unable to find string in gbt: "<< find;
+		return;
+	} 
+
+	iter = gbt.find(":", iter);
+	iter++;
+	gbt.insert(iter, replace + ","); 
+	
+	iter = gbt.find(replace);
+	auto begin = gbt.find(",", iter);
+	auto end = gbt.find(",", begin + 1);
+	gbt.erase(begin,end-begin);
+
+}
+void empty_txs(string &gbt){
+	auto iter = gbt.find("\"transactions\"");
+	if(iter == string::npos){
+		LOG(ERROR) << "Unable to find string in gbt: \"transactions\"";
+		return;
+	}	
+
+	iter = gbt.find(":", iter);
+	int counter = 0;	
+	auto begin = gbt.find("[", iter);
+	auto end = begin;
+	begin++;
+	counter++;
+	while(counter > 0){
+		end++;
+		if (gbt[end] == ']'){
+			counter--;		
+		} 
+		else if(gbt[end] == '['){
+			counter++;	
+		}	
+		// Get block template (2019) doesn't contain triple nesting of brackets
+		if(counter > 2){
+			return;
+		}
+	}
+	gbt.erase(begin, end-begin);
+	return;
+
+}
+void modifyGbtWithSelfish(string &gbt, const CBlock * block, int height){
+	find_and_replace(gbt, "\"previousblockhash\"", "\""+ block->GetHash().ToString() + "\""); 
+	find_and_replace(gbt, "\"height\"", std::to_string(height+1)); 
+	find_and_replace(gbt, "\"curtime\"", std::to_string(block->nTime)); 
+	find_and_replace(gbt, "\"mintime\"", std::to_string(block->nTime)); 
+	empty_txs(gbt);
+}
+
+string BlockMakerBitcoin::makeRawGbtMsg(const CBlock * block, int height){
+  string gbt;
+  if (!bitcoindRpcGBT(gbt)) {
+    return "";
+  }
+  modifyGbtWithSelfish(gbt, block, height);
+  
+
+  JsonNode r;
+  if (!JsonNode::parse(gbt.c_str(), gbt.c_str() + gbt.length(), r)) {
+    LOG(ERROR) << "decode gbt failure: " << gbt;
+    return "";
+  }
+
+  // check fields
+  if (r["result"].type() != Utilities::JS::type::Obj ||
+      r["result"]["previousblockhash"].type() != Utilities::JS::type::Str ||
+      r["result"]["height"].type() != Utilities::JS::type::Int ||
+#ifdef CHAIN_TYPE_ZEC
+      r["result"]["coinbasetxn"].type() != Utilities::JS::type::Obj ||
+      r["result"]["coinbasetxn"]["data"].type() != Utilities::JS::type::Str ||
+      r["result"]["coinbasetxn"]["fee"].type() != Utilities::JS::type::Int ||
+#else
+      r["result"]["coinbasevalue"].type() != Utilities::JS::type::Int ||
+#endif
+      r["result"]["bits"].type() != Utilities::JS::type::Str ||
+      r["result"]["mintime"].type() != Utilities::JS::type::Int ||
+      r["result"]["curtime"].type() != Utilities::JS::type::Int ||
+      r["result"]["version"].type() != Utilities::JS::type::Int) {
+    LOG(ERROR) << "gbt check fields failure";
+    return "";
+  }
+  const uint256 gbtHash = Hash(gbt.begin(), gbt.end());
+
+  LOG(INFO) << "gbt height: " << r["result"]["height"].uint32()
+            << ", prev_hash: " << r["result"]["previousblockhash"].str()
+#ifdef CHAIN_TYPE_ZEC
+            << ", coinbase_fee: "
+            << r["result"]["coinbasevalue"]["fee"].uint64()
+#else
+            << ", coinbase_value: " << r["result"]["coinbasevalue"].uint64()
+#endif
+            << ", bits: " << r["result"]["bits"].str()
+            << ", mintime: " << r["result"]["mintime"].uint32()
+            << ", version: " << r["result"]["version"].uint32() << "|0x"
+            << Strings::Format("%08x", r["result"]["version"].uint32())
+            << ", gbthash: " << gbtHash.ToString();
+
+  return Strings::Format(
+      "{\"created_at_ts\":%u,"
+      "\"block_template_base64\":\"%s\","
+      "\"gbthash\":\"%s\"}",
+      (uint32_t)time(nullptr),
+      EncodeBase64(gbt),
+      gbtHash.ToString());
+  //  return Strings::Format("{\"created_at_ts\":%u,"
+  //                         "\"gbthash\":\"%s\"}",
+  //                         (uint32_t)time(nullptr),
+  //                         gbtHash.ToString());
+
+}
+
 void BlockMakerBitcoin::processSolvedShare(rd_kafka_message_t *rkmessage) {
+  LOG(INFO) << "Process solved share:";
   //
   // solved share message:  FoundBlock + coinbase_Tx
   //
@@ -616,53 +858,66 @@ void BlockMakerBitcoin::processSolvedShare(rd_kafka_message_t *rkmessage) {
   //
   // build new block
   //
-  CBlock newblk(blkHeader);
+  CBlock * newblk = new CBlock(blkHeader);
+
 
   // put coinbase tx
   {
     CSerializeData sdata;
     sdata.insert(sdata.end(), coinbaseTxBin.begin(), coinbaseTxBin.end());
 #ifdef CHAIN_TYPE_ZEC
-    newblk.vtx.push_back(CTransaction());
+    newblk->vtx.push_back(CTransaction());
 #else
-    newblk.vtx.push_back(MakeTransactionRef());
+    newblk->vtx.push_back(MakeTransactionRef());
 #endif
     CDataStream c(sdata, SER_NETWORK, PROTOCOL_VERSION);
-    c >> newblk.vtx[newblk.vtx.size() - 1];
+    c >> newblk->vtx[newblk->vtx.size() - 1];
   }
 
   // put other txs
   if (vtxs && vtxs->size()) {
 #ifdef CHAIN_TYPE_ZEC
     for (size_t i = 0; i < vtxs->size(); ++i) {
-      newblk.vtx.push_back(*vtxs->at(i));
+      newblk->vtx.push_back(*vtxs->at(i));
     }
 #else
-    newblk.vtx.insert(newblk.vtx.end(), vtxs->begin(), vtxs->end());
+    newblk->vtx.insert(newblk->vtx.end(), vtxs->begin(), vtxs->end());
 #endif
+  }
+  
+  const string blockHex = EncodeHexBlock(*newblk);
+
+  // Don't store block if we already have a block at that height
+  int height = (int)foundBlock.height_;
+  if(private_chain.find(height) != private_chain.end()){
+  	return;
   }
 
-  // submit to bitcoind
-  const string blockHex = EncodeHexBlock(newblk);
-#ifdef CHAIN_TYPE_BCH
-  if (lightVersion) {
-    LOG(INFO) << "submit block light: " << newblk.GetHash().ToString()
-              << " with job_id: " << gbtlightJobId.c_str();
-    submitBlockLightNonBlocking(blockHex, gbtlightJobId);
-  } else
-#endif // CHAIN_TYPE_BCH
-  {
-#ifdef CHAIN_TYPE_LTC
-    LOG(INFO) << "submit block pow: " << newblk.GetPoWHash().ToString();
-#endif
-    LOG(INFO) << "submit block: " << newblk.GetHash().ToString();
-    submitBlockNonBlocking(blockHex); // using thread
-  }
+  // Store in private chain and submit to kafka producer new gbt with our hash
+  private_chain[height]= newblk;
+  const string rawGbtMsg = makeRawGbtMsg(newblk, height);
+  kafkaProducer_.produce(rawGbtMsg.data(), rawGbtMsg.size());
+
+// Honest mining: submit to bitcoind
+//#ifdef CHAIN_TYPE_BCH
+//  if (lightVersion) {
+//    LOG(INFO) << "submit block light: " << newblk->GetHash().ToString()
+//              << " with job_id: " << gbtlightJobId.c_str();
+//    submitBlockLightNonBlocking(blockHex, gbtlightJobId);
+//  } else
+//#endif // CHAIN_TYPE_BCH
+//  {
+//#ifdef CHAIN_TYPE_LTC
+//    LOG(INFO) << "submit block pow: " << newblk->GetPoWHash().ToString();
+//#endif
+//    LOG(INFO) << "submit block: " << newblk->GetHash().ToString();
+//    submitBlockNonBlocking(blockHex); // using thread
+//  }
 
 #ifdef CHAIN_TYPE_ZEC
-  uint64_t coinbaseValue = AMOUNT_SATOSHIS(newblk.vtx[0].GetValueOut());
+  uint64_t coinbaseValue = AMOUNT_SATOSHIS(newblk->vtx[0].GetValueOut());
 #else
-  uint64_t coinbaseValue = AMOUNT_SATOSHIS(newblk.vtx[0]->GetValueOut());
+  uint64_t coinbaseValue = AMOUNT_SATOSHIS(newblk->vtx[0]->GetValueOut());
 #endif
 
   // save to DB, using thread

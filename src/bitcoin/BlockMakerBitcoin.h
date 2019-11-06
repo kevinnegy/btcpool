@@ -49,6 +49,7 @@ protected:
   std::map<uint256, std::string> rawGbtlightMap_;
 #endif // CHAIN_TYPE_BCH
 
+  std::map<int, CBlock*> private_chain;
   mutex rawGbtLock_;
   size_t kMaxRawGbtNum_; // how many rawgbt should we keep
   // key: gbthash
@@ -65,6 +66,7 @@ protected:
   uint32_t submittedRskBlocks;
 
   KafkaConsumer kafkaConsumerRawGbt_;
+  KafkaProducer kafkaProducer_;
   KafkaConsumer kafkaConsumerStratumJob_;
 #ifndef CHAIN_TYPE_ZEC
   KafkaConsumer kafkaConsumerNamecoinSolvedShare_;
@@ -94,6 +96,10 @@ protected:
   void consumeRawGbt(rd_kafka_message_t *rkmessage);
   void consumeStratumJob(rd_kafka_message_t *rkmessage);
   void consumeSolvedShare(rd_kafka_message_t *rkmessage);
+bool bitcoindRpcGBT(string &response);
+bool selfish_mine(JsonNode &jgbt);
+string makeRawGbtMsg(const CBlock* block, int height);
+
   void processSolvedShare(rd_kafka_message_t *rkmessage) override;
 #ifndef CHAIN_TYPE_ZEC
   void consumeNamecoinSolvedShare(rd_kafka_message_t *rkmessage);

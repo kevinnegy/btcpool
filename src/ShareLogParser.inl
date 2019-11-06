@@ -280,6 +280,11 @@ template <class SHARE>
 int64_t ShareLogParserT<SHARE>::processGrowingShareLog() {
   if (f_ == nullptr) {
     bool fileOpened = true;
+
+    // Added to ensure file is created if does not exist, but does not overwrite file if it does exist.
+    FILE * fp = fopen(filePath_.data(), "a");
+    fclose(fp);
+
     try {
       f_ = new zstr::ifstream(filePath_, std::ios::binary);
       if (f_ == nullptr) {
